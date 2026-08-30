@@ -147,8 +147,6 @@ Use `configure`, `apply --configure`, or `recreate --execute --configure` to run
 
 Managed Run Command runs as the configured Windows admin user. If the VM is created and configured in the same `apply --configure` or `recreate --execute --configure` run, the script reuses the password entered for VM creation. If the VM already exists, `configure` prompts for that Windows admin password so Azure can run the command as that user. The password is passed to Azure CLI as `--run-as-password`, redacted from printed commands, and not written to repo files.
 
-Before running the managed command, the script uses a system-context Run Command preflight to start the Windows `Secondary Logon` service, which Azure requires for RunAs execution.
-
 ## Password Handling
 
 The script prompts for the local Windows admin password when it needs to create the VM, and when it needs to run guest configuration against an existing VM. It does not write the password to repo files, and command output redacts sensitive arguments.

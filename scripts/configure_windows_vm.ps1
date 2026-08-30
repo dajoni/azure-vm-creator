@@ -46,11 +46,26 @@ function Invoke-LoggedCommand {
 function Test-WingetPackageInstalled {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Id
+        [string]$Id,
+
+        [string]$Source = ""
     )
 
-    $output = & $script:wingetCommand list --id $Id --exact --accept-source-agreements 2>$null
+    $arguments = @("list", "--id", $Id, "--exact", "--accept-source-agreements")
+    if ($Source) {
+        $arguments += @("--source", $Source)
+    }
+
+    Write-Output ("Checking installed package: {0}" -f $Id)
+    $output = & $script:wingetCommand @arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
+        $text = ($output -join "`n")
+        if ($text -match "No installed package found matching input criteria") {
+            Write-Output "Not installed: $Id"
+        } else {
+            Write-Output "Unable to confirm installed state for ${Id}; attempting install."
+            Write-Output $text
+        }
         return $false
     }
 
@@ -67,7 +82,7 @@ function Install-WingetPackage {
         [switch]$Exact
     )
 
-    if (Test-WingetPackageInstalled -Id $Id) {
+    if (Test-WingetPackageInstalled -Id $Id -Source $Source) {
         Write-Output "Already installed: $Id"
         return
     }
@@ -92,14 +107,15 @@ if (-not $script:wingetCommand) {
     throw "winget could not be resolved from the Azure Run Command context. It may be installed for an interactive user but absent from this process PATH."
 }
 Write-Output "Using winget: $script:wingetCommand"
+Invoke-LoggedCommand -Command $script:wingetCommand -Arguments @("source", "list")
 
 if (-not (Test-Path -LiteralPath $stateDir)) {
     New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 }
 
 Install-WingetPackage -Id "9PLM9XGG6VKS" -Source "msstore"
-Install-WingetPackage -Id "Anthropic.Claude" -Exact
-Install-WingetPackage -Id "Git.Git" -Exact
+Install-WingetPackage -Id "Anthropic.Claude" -Source "winget" -Exact
+Install-WingetPackage -Id "Git.Git" -Source "winget" -Exact
 
 if (-not (Test-Path -LiteralPath $markerPath)) {
     "Configured by azure-vm-creator" | Set-Content -LiteralPath $markerPath -Encoding UTF8

@@ -1256,38 +1256,6 @@ def prompt_run_as_password(username: str) -> str:
     return getpass.getpass(f"Windows admin password for {username}: ")
 
 
-def ensure_secondary_logon_service(args: argparse.Namespace) -> int:
-    print("\n## Guest Configuration Prerequisites")
-    result = run_step(
-        "ensure Windows Secondary Logon service is running",
-        [
-            "vm",
-            "run-command",
-            "invoke",
-            "--resource-group",
-            args.resource_group,
-            "--name",
-            args.vm_name,
-            "--command-id",
-            "RunPowerShellScript",
-            "--scripts",
-            (
-                "Set-Service -Name seclogon -StartupType Manual; "
-                "Start-Service -Name seclogon; "
-                "Get-Service -Name seclogon | Select-Object -ExpandProperty Status"
-            ),
-        ],
-        execute=True,
-        timeout=600,
-    )
-    if not result.ok:
-        return 1
-    print_run_command_output(result.data)
-    if run_command_has_error_output(result.data):
-        return fail("Unable to prepare Windows Secondary Logon service for managed Run Command.")
-    return 0
-
-
 def run_guest_configuration(args: argparse.Namespace, run_as_password: str | None = None) -> int:
     vm = show_vm(args.resource_group, args.vm_name)
     if not vm.ok or not isinstance(vm.data, dict):
@@ -1303,9 +1271,6 @@ def run_guest_configuration(args: argparse.Namespace, run_as_password: str | Non
 
     if run_as_password is None:
         run_as_password = prompt_run_as_password(args.admin_username)
-
-    if ensure_secondary_logon_service(args):
-        return 1
 
     operation = "update" if existing_run_command.ok else "create"
     label = f"{operation} managed guest configuration run command {args.run_command_name}"
