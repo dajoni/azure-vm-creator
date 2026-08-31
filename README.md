@@ -28,7 +28,7 @@ Create or complete missing resources:
 python3 scripts/azure_windows_vm.py apply
 ```
 
-Create or complete missing resources, then run guest configuration:
+Create or complete missing resources, then stage desktop guest configuration:
 
 ```bash
 python3 scripts/azure_windows_vm.py apply --configure
@@ -40,7 +40,7 @@ Validate the deployed Azure state against the script's expected configuration:
 python3 scripts/azure_windows_vm.py validate
 ```
 
-Run guest configuration against an existing VM:
+Stage desktop guest configuration against an existing VM:
 
 ```bash
 python3 scripts/azure_windows_vm.py configure
@@ -95,12 +95,16 @@ python3 scripts/azure_windows_vm.py apply --image-sku 2022-datacenter-azure-edit
 python3 scripts/azure_windows_vm.py apply --image-sku 2022-datacenter-azure-edition-hotpatch
 ```
 
-Guest configuration options are available on `apply`, `configure`, and `recreate`:
+Guest configuration staging options are available on `apply`, `configure`, and `recreate`:
 
 ```bash
 python3 scripts/azure_windows_vm.py configure --config-script scripts/configure_windows_vm.ps1
 python3 scripts/azure_windows_vm.py configure --run-command-name configure-windows-vm
 ```
+
+`--config-script` points to the local PowerShell staging script. The staging script is copied through Azure Run Command, writes the desktop installer to `C:\ProgramData\AzureVmCreator\configure_windows_vm.ps1`, and registers a one-time scheduled task for the next interactive `azureuser` logon.
+
+`--run-command-name` is used as the base name for a temporary managed Run Command resource. The script appends a timestamp and random suffix for each staging run.
 
 ## Defaults
 
@@ -121,8 +125,8 @@ python3 scripts/azure_windows_vm.py configure --run-command-name configure-windo
 - VM public IP: Standard static public IP named `pip-secure-win`
 - Outbound internet: VM public IP
 - Default public RDP NSG rule: none
-- Guest configuration script: `scripts/configure_windows_vm.ps1`
-- Managed Run Command resource: `configure-windows-vm`
+- Guest configuration staging script: `scripts/configure_windows_vm.ps1`
+- Managed Run Command base name: `configure-windows-vm`
 
 ## Connection
 
@@ -143,15 +147,21 @@ The public IP is present so the VM can initiate outbound internet connections. T
 
 Use `validate` to check that the deployed resources still match the script, including the VM size, disk settings, image publisher/offer/SKU, expected public IP attachment, Bastion SKU, VNet/subnet prefixes, and absence of a configured public inbound RDP allow rule on the VM NIC or subnet NSG. Validation also prints all configured custom NSG rules plus the VM private and public IP addresses when the VM can be read.
 
-Use `configure`, `apply --configure`, or `recreate --execute --configure` to run the configured local PowerShell script through a managed Azure VM Run Command resource. This does not require public inbound RDP or WinRM. The script prints the collected PowerShell output after Azure Run Command completes.
+Use `configure`, `apply --configure`, or `recreate --execute --configure` to stage guest configuration through a temporary managed Azure VM Run Command resource. This does not require public inbound RDP or WinRM. Azure Run Command runs only the staging step in the default managed context, prints the staging output, then deletes the temporary managed Run Command resource.
 
-Managed Run Command runs as the configured Windows admin user. If the VM is created and configured in the same `apply --configure` or `recreate --execute --configure` run, the script reuses the password entered for VM creation. If the VM already exists, `configure` prompts for that Windows admin password so Azure can run the command as that user. The password is passed to Azure CLI as `--run-as-password`, redacted from printed commands, and not written to repo files.
+The staged task is named `AzureVmCreator-ConfigureDesktop`. It runs at the next interactive logon for the configured admin user and starts a visible PowerShell window with:
+
+```powershell
+powershell.exe -NoExit -ExecutionPolicy Bypass -File C:\ProgramData\AzureVmCreator\configure_windows_vm.ps1
+```
+
+The desktop installer writes `C:\ProgramData\AzureVmCreator\configure.log`, installs ChatGPT, Claude, and Git through `winget`, writes `C:\ProgramData\AzureVmCreator\configured.txt` after success, and removes the scheduled task only after all installs succeed. Failed installs leave the task in place for retry at the next login.
 
 ## Password Handling
 
-The script prompts for the local Windows admin password when it needs to create the VM, and when it needs to run guest configuration against an existing VM. It does not write the password to repo files, and command output redacts sensitive arguments.
+The script prompts for the local Windows admin password only when it needs to create the VM. Guest configuration staging does not require or store the Windows password. It registers an interactive logon task for the configured admin user instead.
 
-One caveat: Azure CLI receives the password as a process argument during VM creation and managed Run Command execution. Avoid running this from a shared machine where local process arguments may be visible to other users.
+One caveat: Azure CLI receives the password as a process argument during VM creation. Avoid running VM creation from a shared machine where local process arguments may be visible to other users.
 
 ## Safety
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -230,23 +231,6 @@ def show_nsg_by_id(nsg_id: str) -> CommandResult:
     return az(["network", "nsg", "show", "--ids", nsg_id], timeout=120)
 
 
-def show_vm_run_command(resource_group: str, vm_name: str, run_command_name: str) -> CommandResult:
-    return az(
-        [
-            "vm",
-            "run-command",
-            "show",
-            "--resource-group",
-            resource_group,
-            "--vm-name",
-            vm_name,
-            "--run-command-name",
-            run_command_name,
-        ],
-        timeout=120,
-    )
-
-
 def show_vm_run_command_instance_view(resource_group: str, vm_name: str, run_command_name: str) -> CommandResult:
     return az(
         [
@@ -262,6 +246,24 @@ def show_vm_run_command_instance_view(resource_group: str, vm_name: str, run_com
             "--instance-view",
         ],
         timeout=120,
+    )
+
+
+def delete_vm_run_command(resource_group: str, vm_name: str, run_command_name: str) -> CommandResult:
+    return az(
+        [
+            "vm",
+            "run-command",
+            "delete",
+            "--resource-group",
+            resource_group,
+            "--vm-name",
+            vm_name,
+            "--run-command-name",
+            run_command_name,
+            "--yes",
+        ],
+        timeout=300,
     )
 
 
@@ -745,12 +747,15 @@ def add_config_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config-script",
         default=DEFAULT_CONFIG_SCRIPT,
-        help=f"Local PowerShell script to run with Azure VM Run Command. Default: {DEFAULT_CONFIG_SCRIPT}.",
+        help=(
+            "Local PowerShell staging script to run with Azure VM Run Command. "
+            f"Default: {DEFAULT_CONFIG_SCRIPT}."
+        ),
     )
     parser.add_argument(
         "--run-command-name",
         default=DEFAULT_RUN_COMMAND_NAME,
-        help=f"Managed VM Run Command resource name. Default: {DEFAULT_RUN_COMMAND_NAME}.",
+        help=f"Base name for temporary managed VM Run Command resources. Default: {DEFAULT_RUN_COMMAND_NAME}.",
     )
 
 
@@ -769,12 +774,16 @@ def build_parser() -> argparse.ArgumentParser:
     apply = subparsers.add_parser("apply", help="Create missing Azure resources and reuse matching existing resources.")
     add_shared_options(apply)
     add_config_options(apply)
-    apply.add_argument("--configure", action="store_true", help="Run the guest configuration script after applying Azure resources.")
+    apply.add_argument(
+        "--configure",
+        action="store_true",
+        help="Stage the guest configuration scheduled task after applying Azure resources.",
+    )
 
     validate = subparsers.add_parser("validate", help="Validate deployed Azure state against this script.")
     add_shared_options(validate)
 
-    configure = subparsers.add_parser("configure", help="Run the guest configuration script against the existing VM.")
+    configure = subparsers.add_parser("configure", help="Stage the guest configuration scheduled task on the existing VM.")
     add_shared_options(configure)
     add_config_options(configure)
 
@@ -782,7 +791,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_shared_options(recreate)
     add_config_options(recreate)
     recreate.add_argument("--execute", action="store_true", help="Delete and recreate the resource group. Without this flag, recreate is a dry run.")
-    recreate.add_argument("--configure", action="store_true", help="Run the guest configuration script after recreating Azure resources.")
+    recreate.add_argument(
+        "--configure",
+        action="store_true",
+        help="Stage the guest configuration scheduled task after recreating Azure resources.",
+    )
 
     return parser
 
@@ -1000,9 +1013,9 @@ def print_connection(args: argparse.Namespace, state: DeploymentState, vm: dict[
     print("- Bastion Developer supports browser-based RDP only; no CLI tunnel/native client command is created.")
 
 
-def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[DeploymentState | None, int, str | None]:
+def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[DeploymentState | None, int]:
     if validate_resource_compatibility(args, state):
-        return None, 1, None
+        return None, 1
 
     plan = build_resource_plan(state)
     print_resource_plan(args, state, "APPLY", plan)
@@ -1018,7 +1031,7 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
             timeout=180,
         )
         if not result.ok:
-            return None, 1, None
+            return None, 1
 
     if plan.needs_vnet:
         result = run_step(
@@ -1044,7 +1057,7 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
             timeout=300,
         )
         if not result.ok:
-            return None, 1, None
+            return None, 1
     elif plan.needs_subnet:
         result = run_step(
             f"create subnet {args.subnet_name}",
@@ -1066,7 +1079,7 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
             timeout=300,
         )
         if not result.ok:
-            return None, 1, None
+            return None, 1
 
     if plan.needs_bastion:
         result = run_step(
@@ -1094,7 +1107,7 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
                 "Unable to create Azure Bastion Developer. If Developer SKU is unavailable in this region, "
                 "rerun with a future Standard/Premium mode rather than silently creating a paid Bastion SKU.",
                 result,
-            ), None
+            )
 
     if plan.needs_vm_public_ip:
         result = run_step(
@@ -1118,7 +1131,7 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
             timeout=300,
         )
         if not result.ok:
-            return None, 1, None
+            return None, 1
 
     if plan.needs_vm:
         result = run_step(
@@ -1159,19 +1172,19 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
             timeout=1800,
         )
         if not result.ok:
-            return None, 1, None
+            return None, 1
 
     refreshed_state, code = inspect_deployment_state(args)
     if code or not refreshed_state:
-        return None, code or 1, None
+        return None, code or 1
     vm_after = refreshed_state.vm
     if not vm_after.ok or not isinstance(vm_after.data, dict):
-        return None, fail("VM creation completed, but the VM could not be read afterward.", vm_after), None
+        return None, fail("VM creation completed, but the VM could not be read afterward.", vm_after)
     if not vm_has_public_ip(vm_after.data):
-        return None, fail("VM exists but does not have a public IP for outbound internet access."), None
+        return None, fail("VM exists but does not have a public IP for outbound internet access.")
 
     print_connection(args, refreshed_state, vm_after.data)
-    return refreshed_state, 0, admin_password or None
+    return refreshed_state, 0
 
 
 def resolved_config_script(path: str) -> Path:
@@ -1252,11 +1265,15 @@ def print_run_command_output(data: Json) -> None:
         print(message)
 
 
-def prompt_run_as_password(username: str) -> str:
-    return getpass.getpass(f"Windows admin password for {username}: ")
+def temporary_run_command_name(base_name: str) -> str:
+    suffix = f"{int(time.time())}-{secrets.token_hex(3)}"
+    max_length = 80
+    prefix = base_name.strip("-") or DEFAULT_RUN_COMMAND_NAME
+    allowed_prefix_length = max_length - len(suffix) - 1
+    return f"{prefix[:allowed_prefix_length].rstrip('-')}-{suffix}"
 
 
-def run_guest_configuration(args: argparse.Namespace, run_as_password: str | None = None) -> int:
+def run_guest_configuration(args: argparse.Namespace) -> int:
     vm = show_vm(args.resource_group, args.vm_name)
     if not vm.ok or not isinstance(vm.data, dict):
         return fail(f"VM {args.vm_name} does not exist or cannot be read. Run `apply` first.", vm)
@@ -1265,22 +1282,17 @@ def run_guest_configuration(args: argparse.Namespace, run_as_password: str | Non
     if not script.is_file():
         return fail(f"Configuration script was not found: {script}")
 
-    existing_run_command = show_vm_run_command(args.resource_group, args.vm_name, args.run_command_name)
-    if not existing_run_command.ok and not resource_missing(existing_run_command):
-        return fail(f"Unable to inspect managed Run Command {args.run_command_name}.", existing_run_command)
-
-    if run_as_password is None:
-        run_as_password = prompt_run_as_password(args.admin_username)
-
-    operation = "update" if existing_run_command.ok else "create"
-    label = f"{operation} managed guest configuration run command {args.run_command_name}"
+    run_command_name = temporary_run_command_name(args.run_command_name)
     print("\n## Guest Configuration")
+    print(f"- temporary managed Run Command: {run_command_name}")
+    print(f"- target desktop user: {args.admin_username}")
+
     result = run_step(
-        label,
+        f"create managed guest configuration staging run command {run_command_name}",
         [
             "vm",
             "run-command",
-            operation,
+            "create",
             "--resource-group",
             args.resource_group,
             "--vm-name",
@@ -1288,32 +1300,57 @@ def run_guest_configuration(args: argparse.Namespace, run_as_password: str | Non
             "--location",
             args.location,
             "--run-command-name",
-            args.run_command_name,
+            run_command_name,
             "--script",
             f"@{script}",
-            "--run-as-user",
-            args.admin_username,
-            "--run-as-password",
-            run_as_password,
+            "--parameters",
+            f"AdminUsername={args.admin_username}",
             "--timeout-in-seconds",
-            "3600",
+            "900",
             "--async-execution",
             "false",
         ],
         execute=True,
-        timeout=3900,
+        timeout=1200,
     )
     if not result.ok:
+        delete_vm_run_command(args.resource_group, args.vm_name, run_command_name)
         return 1
 
-    instance_view = show_vm_run_command_instance_view(args.resource_group, args.vm_name, args.run_command_name)
+    instance_view = show_vm_run_command_instance_view(args.resource_group, args.vm_name, run_command_name)
     if not instance_view.ok:
-        return fail(f"Unable to read managed Run Command output for {args.run_command_name}.", instance_view)
+        delete_vm_run_command(args.resource_group, args.vm_name, run_command_name)
+        return fail(f"Unable to read managed Run Command output for {run_command_name}.", instance_view)
 
     print_run_command_output(instance_view.data)
-    if run_command_has_error_output(instance_view.data):
-        return fail("Guest configuration failed. Azure Run Command returned stderr output.")
-    print("- guest configuration completed")
+    has_error = run_command_has_error_output(instance_view.data)
+
+    print("\n## Guest Configuration Cleanup")
+    cleanup = run_step(
+        f"delete temporary managed Run Command {run_command_name}",
+        [
+            "vm",
+            "run-command",
+            "delete",
+            "--resource-group",
+            args.resource_group,
+            "--vm-name",
+            args.vm_name,
+            "--run-command-name",
+            run_command_name,
+            "--yes",
+        ],
+        execute=True,
+        timeout=300,
+    )
+    if not cleanup.ok:
+        return 1
+
+    if has_error:
+        return fail("Guest configuration staging failed. Azure Run Command returned stderr output.")
+    print("- guest configuration scheduled task staged")
+    print(f"- log in through Azure Bastion as {args.admin_username}; a PowerShell window should open and show progress")
+    print("- installer log on the VM: C:\\ProgramData\\AzureVmCreator\\configure.log")
     return 0
 
 
@@ -1332,11 +1369,11 @@ def handle_apply(args: argparse.Namespace) -> int:
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
-    _, code, admin_password = apply_resources(args, state)
+    _, code = apply_resources(args, state)
     if code:
         return code
     if args.configure:
-        return run_guest_configuration(args, admin_password)
+        return run_guest_configuration(args)
     return 0
 
 
@@ -1411,11 +1448,11 @@ def handle_recreate(args: argparse.Namespace) -> int:
         public_ip_resource=CommandResult(False, [], error="NotFound"),
         vm=CommandResult(False, [], error="NotFound"),
     )
-    _, code, admin_password = apply_resources(args, missing_state)
+    _, code = apply_resources(args, missing_state)
     if code:
         return code
     if args.configure:
-        return run_guest_configuration(args, admin_password)
+        return run_guest_configuration(args)
     return 0
 
 
