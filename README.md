@@ -59,7 +59,20 @@ python3 scripts/azure_windows_vm.py recreate --execute
 python3 scripts/azure_windows_vm.py recreate --execute --configure
 ```
 
-Shared options are available on `dryrun`, `apply`, `validate`, `configure`, and `recreate`:
+Preview removal of the script-owned resource group:
+
+```bash
+python3 scripts/azure_windows_vm.py teardown
+```
+
+Remove the script-owned resource group:
+
+```bash
+python3 scripts/azure_windows_vm.py teardown --execute
+python3 scripts/azure_windows_vm.py teardown --resource-group rg-secure-winvm --execute
+```
+
+Shared options are available on `dryrun`, `apply`, `validate`, `configure`, `recreate`, and `teardown`:
 
 ```bash
 python3 scripts/azure_windows_vm.py apply --location northeurope
@@ -169,6 +182,8 @@ One caveat: Azure CLI receives the password as a process argument during VM crea
 - `apply` creates Azure resources.
 - `recreate` is read-only unless `--execute` is passed.
 - `recreate --execute` deletes and recreates the configured resource group.
+- `teardown` is read-only unless `--execute` is passed.
+- `teardown --execute` deletes the configured resource group only.
 - The script does not delete the Azure subscription.
 - The script does not create or delete tenant-wide Entra ID objects.
 
@@ -184,6 +199,8 @@ python3 scripts/azure_windows_vm.py apply --help
 python3 scripts/azure_windows_vm.py validate --help
 python3 scripts/azure_windows_vm.py configure --help
 python3 scripts/azure_windows_vm.py recreate --help
+python3 scripts/azure_windows_vm.py teardown --help
 python3 scripts/azure_windows_vm.py dryrun
+python3 scripts/azure_windows_vm.py teardown
 python3 scripts/azure_windows_vm.py validate
 ```

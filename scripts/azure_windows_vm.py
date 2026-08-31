@@ -797,6 +797,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stage the guest configuration scheduled task after recreating Azure resources.",
     )
 
+    teardown = subparsers.add_parser("teardown", help="Plan or execute removal of the script-owned resource group.")
+    add_shared_options(teardown)
+    teardown.add_argument("--execute", action="store_true", help="Delete the resource group. Without this flag, teardown is a dry run.")
+
     return parser
 
 
@@ -1456,11 +1460,48 @@ def handle_recreate(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_teardown(args: argparse.Namespace) -> int:
+    state, code = inspect_deployment_state(args)
+    if code or not state:
+        return code or 1
+
+    print("# Secure Windows VM Teardown Plan")
+    print(f"\nMode: {'TEARDOWN EXECUTE' if args.execute else 'TEARDOWN DRY RUN'}")
+    print(f"Subscription: {state.subscription_name} ({state.subscription_id})")
+    print(f"Tenant: {state.tenant_id or 'unknown'}")
+    print(f"Location: {args.location}")
+    print(f"Resource group: {args.resource_group}")
+    print("\n## Teardown")
+    if state.rg.ok:
+        print(f"- {'delete' if args.execute else 'would delete'} resource group {args.resource_group}")
+    else:
+        print("- existing resource group: Nothing found.")
+
+    if not args.execute:
+        print("\nDry run only. Nothing changed.")
+        return 0
+
+    if not state.rg.ok:
+        return 0
+
+    deleted = run_step(
+        f"delete resource group {args.resource_group}",
+        ["group", "delete", "--name", args.resource_group, "--yes", "--no-wait"],
+        execute=True,
+        timeout=180,
+    )
+    if not deleted.ok:
+        return 1
+    if not wait_for_group_deleted(args.resource_group):
+        return 1
+    return 0
+
+
 def main() -> int:
     old_flags = {"--execute", "--validate", "--recreate"}
     if len(sys.argv) > 1 and sys.argv[1] in old_flags:
         return fail(
-            "Top-level flags were removed. Use `dryrun`, `apply`, `validate`, `configure`, or `recreate` subcommands."
+            "Top-level flags were removed. Use `dryrun`, `apply`, `validate`, `configure`, `recreate`, or `teardown` subcommands."
         )
 
     parser = build_parser()
@@ -1472,6 +1513,7 @@ def main() -> int:
         "validate": handle_validate,
         "configure": handle_configure,
         "recreate": handle_recreate,
+        "teardown": handle_teardown,
     }
     return handlers[args.command](args)
 
