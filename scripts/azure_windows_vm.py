@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Create a Windows VM reachable through Azure Bastion Developer.
+"""Create a Windows or Linux VM reachable through Azure Bastion Developer.
 
 The VM is created with a public IP address for outbound internet access, but no
-public inbound RDP rule. Azure CLI's default subscription from `az account show`
-is used as the deployment target.
+public inbound RDP or SSH rule. Azure CLI's default subscription from
+`az account show` is used as the deployment target.
 """
 
 from __future__ import annotations
@@ -26,7 +26,9 @@ Json = dict[str, Any] | list[Any] | str | int | float | bool | None
 
 DEFAULT_LOCATION = "northeurope"
 DEFAULT_RESOURCE_GROUP = "rg-secure-winvm"
+DEFAULT_LINUX_RESOURCE_GROUP = "rg-secure-linuxvm"
 DEFAULT_VM_NAME = "vm-secure-win"
+DEFAULT_LINUX_VM_NAME = "vm-secure-linux"
 DEFAULT_ADMIN_USERNAME = "azureuser"
 DEFAULT_VM_SIZE = "Standard_B2as_v2"
 DEFAULT_IMAGE_PUBLISHER = "MicrosoftWindowsServer"
@@ -34,17 +36,25 @@ DEFAULT_IMAGE_OFFER = "WindowsServer"
 DEFAULT_IMAGE_SKU = "2025-datacenter-azure-edition"
 DEFAULT_IMAGE_VERSION = "latest"
 DEFAULT_IMAGE = f"{DEFAULT_IMAGE_PUBLISHER}:{DEFAULT_IMAGE_OFFER}:{DEFAULT_IMAGE_SKU}:{DEFAULT_IMAGE_VERSION}"
+DEFAULT_LINUX_IMAGE = "Canonical:ubuntu-26_04-lts:server:latest"
 DEFAULT_STORAGE_SKU = "StandardSSD_LRS"
 DEFAULT_OS_DISK_SIZE_GB = 127
 DEFAULT_OS_DISK_DELETE_OPTION = "Delete"
 DEFAULT_VNET_NAME = "vnet-secure-win"
+DEFAULT_LINUX_VNET_NAME = "vnet-secure-linux"
 DEFAULT_SUBNET_NAME = "subnet-secure-win"
+DEFAULT_LINUX_SUBNET_NAME = "subnet-secure-linux"
 DEFAULT_BASTION_NAME = "bastion-secure-win"
+DEFAULT_LINUX_BASTION_NAME = "bastion-secure-linux"
 DEFAULT_VM_PUBLIC_IP_NAME = "pip-secure-win"
+DEFAULT_LINUX_VM_PUBLIC_IP_NAME = "pip-secure-linux"
 DEFAULT_CONFIG_SCRIPT = "scripts/configure_windows_vm.ps1"
 DEFAULT_RUN_COMMAND_NAME = "configure-windows-vm"
 DEFAULT_VNET_PREFIX = "10.42.0.0/16"
 DEFAULT_SUBNET_PREFIX = "10.42.1.0/24"
+OS_TYPES = {"windows", "linux"}
+SSH_NSG_RULE_NAME = "AllowSshFromInternet"
+SSH_NSG_RULE_PRIORITY = "1000"
 
 
 @dataclass
@@ -231,6 +241,80 @@ def show_nsg_by_id(nsg_id: str) -> CommandResult:
     return az(["network", "nsg", "show", "--ids", nsg_id], timeout=120)
 
 
+def show_nsg_rule(resource_group: str, nsg_name: str, rule_name: str) -> CommandResult:
+    return az(
+        [
+            "network",
+            "nsg",
+            "rule",
+            "show",
+            "--resource-group",
+            resource_group,
+            "--nsg-name",
+            nsg_name,
+            "--name",
+            rule_name,
+        ],
+        timeout=120,
+    )
+
+
+def create_or_update_nsg_rule(resource_group: str, nsg_name: str, rule_name: str) -> CommandResult:
+    existing = show_nsg_rule(resource_group, nsg_name, rule_name)
+    if not existing.ok and not resource_missing(existing):
+        return existing
+    action = "update" if existing.ok else "create"
+    return az(
+        [
+            "network",
+            "nsg",
+            "rule",
+            action,
+            "--resource-group",
+            resource_group,
+            "--nsg-name",
+            nsg_name,
+            "--name",
+            rule_name,
+            "--priority",
+            SSH_NSG_RULE_PRIORITY,
+            "--direction",
+            "Inbound",
+            "--access",
+            "Allow",
+            "--protocol",
+            "Tcp",
+            "--source-address-prefixes",
+            "Internet",
+            "--source-port-ranges",
+            "*",
+            "--destination-address-prefixes",
+            "*",
+            "--destination-port-ranges",
+            "22",
+        ],
+        timeout=300,
+    )
+
+
+def delete_nsg_rule(resource_group: str, nsg_name: str, rule_name: str) -> CommandResult:
+    return az(
+        [
+            "network",
+            "nsg",
+            "rule",
+            "delete",
+            "--resource-group",
+            resource_group,
+            "--nsg-name",
+            nsg_name,
+            "--name",
+            rule_name,
+        ],
+        timeout=300,
+    )
+
+
 def show_vm_run_command_instance_view(resource_group: str, vm_name: str, run_command_name: str) -> CommandResult:
     return az(
         [
@@ -353,6 +437,15 @@ def resource_id_name(resource_id: str) -> str:
     return resource_id.rstrip("/").split("/")[-1] if resource_id else ""
 
 
+def resource_id_resource_group(resource_id: str) -> str:
+    parts = [part for part in resource_id.strip("/").split("/") if part]
+    lowered = [part.lower() for part in parts]
+    if "resourcegroups" not in lowered:
+        return ""
+    index = lowered.index("resourcegroups")
+    return parts[index + 1] if index + 1 < len(parts) else ""
+
+
 def resource_id_equals(left: str, right: str) -> bool:
     return left.rstrip("/").lower() == right.rstrip("/").lower()
 
@@ -409,7 +502,23 @@ def public_source_prefix(prefix: str) -> bool:
     return normalized in {"*", "internet", "any", "0.0.0.0/0", "::/0"}
 
 
-def rule_allows_public_rdp(rule: dict[str, Any]) -> bool:
+def os_display_name(args: argparse.Namespace) -> str:
+    return "Linux" if args.os_type == "linux" else "Windows"
+
+
+def access_protocol(args: argparse.Namespace) -> str:
+    return "SSH" if args.os_type == "linux" else "RDP"
+
+
+def access_port(args: argparse.Namespace) -> int:
+    return 22 if args.os_type == "linux" else 3389
+
+
+def selected_image(args: argparse.Namespace) -> str:
+    return args.linux_image if args.os_type == "linux" else vm_image(args.image_sku)
+
+
+def rule_allows_public_access(rule: dict[str, Any], port: int) -> bool:
     if str(rule.get("access") or "").lower() != "allow":
         return False
     if str(rule.get("direction") or "").lower() != "inbound":
@@ -423,7 +532,7 @@ def rule_allows_public_rdp(rule: dict[str, Any]) -> bool:
         return False
 
     ports = as_list(rule.get("destinationPortRanges")) or [rule.get("destinationPortRange")]
-    return any(port_range_includes(str(port or ""), 3389) for port in ports)
+    return any(port_range_includes(str(port_range or ""), port) for port_range in ports)
 
 
 def compact_values(*values: Any) -> str:
@@ -469,10 +578,10 @@ def vm_os_disk_conflicts(vm: dict[str, Any], storage_sku: str, os_disk_size_gb: 
     return conflicts
 
 
-def vm_image_conflicts(vm: dict[str, Any], image_sku: str) -> list[str]:
-    expected = vm_image(image_sku).split(":")
+def vm_image_conflicts(vm: dict[str, Any], expected_image: str) -> list[str]:
+    expected = expected_image.split(":")
     conflicts: list[str] = []
-    if len(expected) < 3:
+    if len(expected) != 4:
         return conflicts
     expected_publisher, expected_offer, expected_sku = expected[:3]
     actual_publisher = str(get_path(vm, "storageProfile.imageReference.publisher", default="") or "")
@@ -501,6 +610,7 @@ def validate_existing_state(
     vm: CommandResult,
 ) -> int:
     failures = 0
+    warnings: list[str] = []
 
     def check(ok: bool, label: str, detail: str = "") -> None:
         nonlocal failures
@@ -511,7 +621,15 @@ def validate_existing_state(
         suffix = f": {detail}" if detail else ""
         print(f"- FAIL: {label}{suffix}")
 
-    print("# Secure Windows VM Validation")
+    def warn(label: str, detail: str = "") -> None:
+        suffix = f": {detail}" if detail else ""
+        warnings.append(f"{label}{suffix}")
+        print(f"- WARN: {label}{suffix}")
+
+    protocol = access_protocol(args)
+    port = access_port(args)
+
+    print(f"# Secure {os_display_name(args)} VM Validation")
     print(f"\nSubscription: {subscription_name} ({subscription_id})")
     print(f"Tenant: {tenant_id or 'unknown'}")
     print(f"Expected resource group: {args.resource_group}")
@@ -573,7 +691,7 @@ def validate_existing_state(
         )
         check(not disk_conflicts, "VM OS disk settings match", "; ".join(disk_conflicts))
 
-        image_conflicts = vm_image_conflicts(vm.data, args.image_sku)
+        image_conflicts = vm_image_conflicts(vm.data, selected_image(args))
         check(not image_conflicts, "VM image matches expected publisher/offer/SKU", "; ".join(image_conflicts))
 
         nic_ids = vm_nic_ids(vm.data)
@@ -615,7 +733,8 @@ def validate_existing_state(
     check(bool(nsg_ids), "NIC or subnet has an NSG attached", "no configured NSG found")
 
     nsg_rule_summaries: dict[str, list[str]] = {}
-    public_rdp_rules: list[str] = []
+    public_access_rules: list[str] = []
+    managed_ssh_rule_found = False
     for nsg_id in nsg_ids:
         nsg = show_nsg_by_id(nsg_id)
         nsg_name = resource_id_name(nsg_id)
@@ -628,9 +747,23 @@ def validate_existing_state(
             if isinstance(rule, dict)
         ]
         for rule in as_list(nsg.data.get("securityRules")):
-            if isinstance(rule, dict) and rule_allows_public_rdp(rule):
-                public_rdp_rules.append(f"{nsg_name}/{rule.get('name', 'unnamed')}")
-    check(not public_rdp_rules, "no configured public inbound RDP allow rule", ", ".join(public_rdp_rules))
+            if not isinstance(rule, dict) or not rule_allows_public_access(rule, port):
+                continue
+            rule_ref = f"{nsg_name}/{rule.get('name', 'unnamed')}"
+            public_access_rules.append(rule_ref)
+            if args.os_type == "linux" and str(rule.get("name") or "") == SSH_NSG_RULE_NAME:
+                managed_ssh_rule_found = True
+    if args.os_type == "linux":
+        if public_access_rules:
+            warn(f"configured public inbound {protocol} allow rule", ", ".join(public_access_rules))
+        if managed_ssh_rule_found:
+            warn(f"script-managed {SSH_NSG_RULE_NAME} rule is enabled")
+    else:
+        check(
+            not public_access_rules,
+            f"no configured public inbound {protocol} allow rule",
+            ", ".join(public_access_rules),
+        )
 
     print("\n## Network Security Group Rules")
     if not nsg_rule_summaries:
@@ -650,6 +783,10 @@ def validate_existing_state(
     if failures:
         print(f"\nValidation failed with {failures} issue(s).")
         return 1
+
+    if warnings:
+        print(f"\nValidation passed with {len(warnings)} warning(s).")
+        return 0
 
     print("\nValidation passed. Azure state matches the script's expected configuration.")
     return 0
@@ -680,17 +817,30 @@ def vm_image(image_sku: str) -> str:
 
 
 def add_shared_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--os-type",
+        default="windows",
+        choices=sorted(OS_TYPES),
+        help="Guest operating system to create. Default: windows.",
+    )
     parser.add_argument("--location", default=DEFAULT_LOCATION, help=f"Azure region. Default: {DEFAULT_LOCATION}.")
     parser.add_argument(
         "--resource-group",
-        default=DEFAULT_RESOURCE_GROUP,
-        help=f"Script-owned resource group. Default: {DEFAULT_RESOURCE_GROUP}.",
+        default=None,
+        help=(
+            f"Script-owned resource group. Default: {DEFAULT_RESOURCE_GROUP} for Windows, "
+            f"{DEFAULT_LINUX_RESOURCE_GROUP} for Linux."
+        ),
     )
-    parser.add_argument("--vm-name", default=DEFAULT_VM_NAME, help=f"VM name. Default: {DEFAULT_VM_NAME}.")
+    parser.add_argument(
+        "--vm-name",
+        default=None,
+        help=f"VM name. Default: {DEFAULT_VM_NAME} for Windows, {DEFAULT_LINUX_VM_NAME} for Linux.",
+    )
     parser.add_argument(
         "--admin-username",
         default=DEFAULT_ADMIN_USERNAME,
-        help=f"Local Windows admin username. Default: {DEFAULT_ADMIN_USERNAME}.",
+        help=f"Local VM admin username. Default: {DEFAULT_ADMIN_USERNAME}.",
     )
     parser.add_argument(
         "--size",
@@ -709,6 +859,23 @@ def add_shared_options(parser: argparse.ArgumentParser) -> None:
             "Examples: 2025-datacenter-azure-edition-core, "
             "2025-datacenter-azure-edition-smalldisk, 2022-datacenter-azure-edition, "
             "2022-datacenter-azure-edition-core, 2022-datacenter-azure-edition-hotpatch."
+        ),
+    )
+    parser.add_argument(
+        "--linux-image",
+        default=DEFAULT_LINUX_IMAGE,
+        help=(
+            "Linux image alias, URN, custom image name, or image ID. "
+            f"Default: {DEFAULT_LINUX_IMAGE}."
+        ),
+    )
+    parser.add_argument(
+        "--ssh-key-values",
+        nargs="+",
+        default=[],
+        help=(
+            "Linux SSH public key file path(s) or public key value(s). "
+            "When omitted for Linux, Azure CLI runs with --generate-ssh-keys."
         ),
     )
     parser.add_argument(
@@ -737,10 +904,26 @@ def add_shared_options(parser: argparse.ArgumentParser) -> None:
         choices=["Delete", "Detach"],
         help=f"What happens to the OS disk when the VM is deleted. Default: {DEFAULT_OS_DISK_DELETE_OPTION}.",
     )
-    parser.add_argument("--public-ip-name", default=DEFAULT_VM_PUBLIC_IP_NAME, help=f"VM public IP name. Default: {DEFAULT_VM_PUBLIC_IP_NAME}.")
-    parser.add_argument("--vnet-name", default=DEFAULT_VNET_NAME, help=f"Virtual network name. Default: {DEFAULT_VNET_NAME}.")
-    parser.add_argument("--subnet-name", default=DEFAULT_SUBNET_NAME, help=f"VM subnet name. Default: {DEFAULT_SUBNET_NAME}.")
-    parser.add_argument("--bastion-name", default=DEFAULT_BASTION_NAME, help=f"Bastion name. Default: {DEFAULT_BASTION_NAME}.")
+    parser.add_argument(
+        "--public-ip-name",
+        default=None,
+        help=f"VM public IP name. Default: {DEFAULT_VM_PUBLIC_IP_NAME} for Windows, {DEFAULT_LINUX_VM_PUBLIC_IP_NAME} for Linux.",
+    )
+    parser.add_argument(
+        "--vnet-name",
+        default=None,
+        help=f"Virtual network name. Default: {DEFAULT_VNET_NAME} for Windows, {DEFAULT_LINUX_VNET_NAME} for Linux.",
+    )
+    parser.add_argument(
+        "--subnet-name",
+        default=None,
+        help=f"VM subnet name. Default: {DEFAULT_SUBNET_NAME} for Windows, {DEFAULT_LINUX_SUBNET_NAME} for Linux.",
+    )
+    parser.add_argument(
+        "--bastion-name",
+        default=None,
+        help=f"Bastion name. Default: {DEFAULT_BASTION_NAME} for Windows, {DEFAULT_LINUX_BASTION_NAME} for Linux.",
+    )
 
 
 def add_config_options(parser: argparse.ArgumentParser) -> None:
@@ -762,8 +945,8 @@ def add_config_options(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Create and manage an idempotent Windows VM with outbound internet through a VM public IP "
-            "and RDP through Azure Bastion Developer."
+            "Create and manage an idempotent Windows or Linux VM with outbound internet through a VM public IP "
+            "and access through Azure Bastion Developer."
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -801,7 +984,47 @@ def build_parser() -> argparse.ArgumentParser:
     add_shared_options(teardown)
     teardown.add_argument("--execute", action="store_true", help="Delete the resource group. Without this flag, teardown is a dry run.")
 
+    nsg_ssh = subparsers.add_parser("nsg-ssh", help="Enable or disable the script-managed public SSH NSG rule for a Linux VM.")
+    nsg_ssh.add_argument("action", choices=["enable", "disable"], help="Enable or disable direct public SSH.")
+    add_shared_options(nsg_ssh)
+
     return parser
+
+
+def apply_os_defaults(args: argparse.Namespace) -> None:
+    defaults = {
+        "windows": {
+            "resource_group": DEFAULT_RESOURCE_GROUP,
+            "vm_name": DEFAULT_VM_NAME,
+            "vnet_name": DEFAULT_VNET_NAME,
+            "subnet_name": DEFAULT_SUBNET_NAME,
+            "bastion_name": DEFAULT_BASTION_NAME,
+            "public_ip_name": DEFAULT_VM_PUBLIC_IP_NAME,
+        },
+        "linux": {
+            "resource_group": DEFAULT_LINUX_RESOURCE_GROUP,
+            "vm_name": DEFAULT_LINUX_VM_NAME,
+            "vnet_name": DEFAULT_LINUX_VNET_NAME,
+            "subnet_name": DEFAULT_LINUX_SUBNET_NAME,
+            "bastion_name": DEFAULT_LINUX_BASTION_NAME,
+            "public_ip_name": DEFAULT_LINUX_VM_PUBLIC_IP_NAME,
+        },
+    }
+    for attr, value in defaults[args.os_type].items():
+        if getattr(args, attr) is None:
+            setattr(args, attr, value)
+
+
+def validate_command_options(args: argparse.Namespace) -> int:
+    if args.command == "nsg-ssh" and args.os_type != "linux":
+        return fail("The `nsg-ssh` command is Linux-only. Rerun with `--os-type linux`.")
+    if args.os_type == "linux" and getattr(args, "configure", False):
+        return fail("Linux guest configuration is not implemented. Run without `--configure` for an SSH-ready Linux VM.")
+    if args.os_type == "linux" and args.command == "configure":
+        return fail("Linux guest configuration is not implemented. The `configure` command is Windows-only.")
+    if args.os_type == "windows" and args.ssh_key_values:
+        return fail("`--ssh-key-values` applies only when `--os-type linux` is selected.")
+    return 0
 
 
 def inspect_deployment_state(args: argparse.Namespace) -> tuple[DeploymentState | None, int]:
@@ -946,7 +1169,7 @@ def validate_resource_compatibility(args: argparse.Namespace, state: DeploymentS
         if disk_conflicts:
             return fail(f"VM {args.vm_name} already exists with incompatible disk settings: {'; '.join(disk_conflicts)}.")
 
-        image_conflicts = vm_image_conflicts(state.vm.data, args.image_sku)
+        image_conflicts = vm_image_conflicts(state.vm.data, selected_image(args))
         if image_conflicts:
             return fail(f"VM {args.vm_name} already exists with incompatible image settings: {'; '.join(image_conflicts)}.")
 
@@ -965,21 +1188,28 @@ def build_resource_plan(state: DeploymentState) -> ResourcePlan:
 
 
 def print_resource_plan(args: argparse.Namespace, state: DeploymentState, mode: str, plan: ResourcePlan) -> None:
-    print("# Secure Windows VM Plan")
+    os_name = os_display_name(args)
+    protocol = access_protocol(args)
+
+    print(f"# Secure {os_name} VM Plan")
     print(f"\nMode: {mode}")
     print(f"Subscription: {state.subscription_name} ({state.subscription_id})")
     print(f"Tenant: {state.tenant_id or 'unknown'}")
     print(f"Location: {args.location}")
     print(f"Resource group: {args.resource_group}")
+    print(f"OS type: {args.os_type}")
     print(f"VM: {args.vm_name}")
-    print(f"Image: {vm_image(args.image_sku)}")
+    print(f"Image: {selected_image(args)}")
     print(f"Size: {args.size}")
     print(f"OS disk: {args.os_disk_size_gb} GB {args.storage_sku}")
     print(f"OS disk delete option: {args.os_disk_delete_option}")
-    print("Desktop access: Azure Bastion Developer portal RDP")
+    print(f"Access: Azure Bastion Developer portal {protocol}")
     print(f"VM public IP: {args.public_ip_name}")
     print("Outbound internet: VM public IP")
-    print("Default public RDP NSG rule: none")
+    print(f"Default public {protocol} NSG rule: none")
+    if args.os_type == "linux":
+        ssh_key_mode = "provided SSH key value(s)" if args.ssh_key_values else "Azure CLI --generate-ssh-keys"
+        print(f"SSH keys: {ssh_key_mode}")
 
     print("\n## Planned Changes")
     if not plan.needs_anything:
@@ -996,7 +1226,7 @@ def print_resource_plan(args: argparse.Namespace, state: DeploymentState, mode: 
     if plan.needs_vm_public_ip:
         print(f"- create Standard static public IP {args.public_ip_name} for VM outbound internet")
     if plan.needs_vm:
-        print(f"- create Windows VM {args.vm_name} with public IP {args.public_ip_name}")
+        print(f"- create {os_name} VM {args.vm_name} with public IP {args.public_ip_name}")
 
 
 def print_connection(args: argparse.Namespace, state: DeploymentState, vm: dict[str, Any]) -> None:
@@ -1009,12 +1239,84 @@ def print_connection(args: argparse.Namespace, state: DeploymentState, vm: dict[
     print("- In the portal, open the VM and choose: Connect > Bastion.")
     print(f"- VM private IP: {private_ip}")
     print(f"- VM public IP: {public_ip}")
-    print("- Public inbound RDP rule created by this script: none")
+    if args.os_type == "linux":
+        print("- Public inbound SSH rule created by this script: none")
+        print("- The public IP is for VM outbound internet; use Bastion Developer for portal SSH access.")
+        print("- To enable direct public SSH on demand: nsg-ssh enable --os-type linux")
+        if public_ip != "unavailable":
+            print(f"- SSH command after enabling direct public SSH: ssh {args.admin_username}@{public_ip}")
+    else:
+        print("- Public inbound RDP rule created by this script: none")
     print(f"- Username: {args.admin_username}")
     print(f"- Resource group: {args.resource_group}")
     print(f"- Subscription: {state.subscription_name} ({state.subscription_id})")
     print(f"- Tenant: {state.tenant_id or 'unknown'}")
-    print("- Bastion Developer supports browser-based RDP only; no CLI tunnel/native client command is created.")
+    print(
+        f"- Bastion Developer supports browser-based {access_protocol(args)} only; "
+        "no CLI tunnel/native client command is created."
+    )
+
+
+def ssh_key_values(args: argparse.Namespace) -> list[str]:
+    values: list[str] = []
+    for value in args.ssh_key_values:
+        if value.startswith("~/") or value == "~":
+            values.append(str(Path(value).expanduser()))
+        else:
+            values.append(value)
+    return values
+
+
+def print_ssh_command(args: argparse.Namespace) -> None:
+    public_ip = vm_public_ip_address(args.resource_group, args.vm_name)
+    if public_ip == "unavailable":
+        print("- SSH command: unavailable; VM public IP could not be read")
+        return
+    print(f"- SSH command: ssh {args.admin_username}@{public_ip}")
+
+
+def vm_create_args(args: argparse.Namespace, admin_password: str) -> list[str]:
+    command = [
+        "vm",
+        "create",
+        "--resource-group",
+        args.resource_group,
+        "--location",
+        args.location,
+        "--name",
+        args.vm_name,
+        "--image",
+        selected_image(args),
+        "--size",
+        args.size,
+        "--vnet-name",
+        args.vnet_name,
+        "--subnet",
+        args.subnet_name,
+        "--public-ip-address",
+        args.public_ip_name,
+        "--nsg-rule",
+        "NONE",
+        "--storage-sku",
+        args.storage_sku,
+        "--os-disk-size-gb",
+        str(args.os_disk_size_gb),
+        "--os-disk-delete-option",
+        args.os_disk_delete_option,
+        "--admin-username",
+        args.admin_username,
+    ]
+
+    if args.os_type == "linux":
+        command.extend(["--authentication-type", "ssh"])
+        if args.ssh_key_values:
+            command.extend(["--ssh-key-values", *ssh_key_values(args)])
+        else:
+            command.append("--generate-ssh-keys")
+        return command
+
+    command.extend(["--admin-password", admin_password])
+    return command
 
 
 def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[DeploymentState | None, int]:
@@ -1024,7 +1326,7 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
     plan = build_resource_plan(state)
     print_resource_plan(args, state, "APPLY", plan)
 
-    admin_password = prompt_password() if plan.needs_vm else ""
+    admin_password = prompt_password() if plan.needs_vm and args.os_type == "windows" else ""
 
     print("\n## Execution")
     if plan.needs_group:
@@ -1139,39 +1441,8 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
 
     if plan.needs_vm:
         result = run_step(
-            f"create Windows VM {args.vm_name}",
-            [
-                "vm",
-                "create",
-                "--resource-group",
-                args.resource_group,
-                "--location",
-                args.location,
-                "--name",
-                args.vm_name,
-                "--image",
-                vm_image(args.image_sku),
-                "--size",
-                args.size,
-                "--vnet-name",
-                args.vnet_name,
-                "--subnet",
-                args.subnet_name,
-                "--public-ip-address",
-                args.public_ip_name,
-                "--nsg-rule",
-                "NONE",
-                "--storage-sku",
-                args.storage_sku,
-                "--os-disk-size-gb",
-                str(args.os_disk_size_gb),
-                "--os-disk-delete-option",
-                args.os_disk_delete_option,
-                "--admin-username",
-                args.admin_username,
-                "--admin-password",
-                admin_password,
-            ],
+            f"create {os_display_name(args)} VM {args.vm_name}",
+            vm_create_args(args, admin_password),
             execute=True,
             timeout=1800,
         )
@@ -1189,6 +1460,84 @@ def apply_resources(args: argparse.Namespace, state: DeploymentState) -> tuple[D
 
     print_connection(args, refreshed_state, vm_after.data)
     return refreshed_state, 0
+
+
+def selected_vm_nsg(args: argparse.Namespace, state: DeploymentState) -> tuple[str, str, int]:
+    if not state.vm.ok or not isinstance(state.vm.data, dict):
+        return "", "", fail(f"VM {args.vm_name} does not exist or cannot be read. Run `apply --os-type linux` first.", state.vm)
+
+    nic_ids = vm_nic_ids(state.vm.data)
+    if len(nic_ids) != 1:
+        return "", "", fail(f"VM {args.vm_name} has {len(nic_ids)} NICs, not one.")
+
+    nic = show_nic_by_id(nic_ids[0])
+    if not nic.ok or not isinstance(nic.data, dict):
+        return "", "", fail(f"Unable to inspect VM NIC {resource_id_name(nic_ids[0])}.", nic)
+
+    nic_nsg_id = str(get_path(nic.data, "networkSecurityGroup.id", default="") or "")
+    if nic_nsg_id:
+        return resource_id_resource_group(nic_nsg_id), resource_id_name(nic_nsg_id), 0
+
+    subnet_nsg_id = ""
+    for subnet_id in nic_subnet_ids(nic.data):
+        subnet_name = resource_id_name(subnet_id)
+        subnet = show_subnet(args.resource_group, args.vnet_name, subnet_name)
+        if not subnet.ok or not isinstance(subnet.data, dict):
+            continue
+        subnet_nsg_id = str(get_path(subnet.data, "networkSecurityGroup.id", default="") or "")
+        if subnet_nsg_id:
+            break
+
+    if not subnet_nsg_id and state.subnet.ok and isinstance(state.subnet.data, dict):
+        subnet_nsg_id = str(get_path(state.subnet.data, "networkSecurityGroup.id", default="") or "")
+
+    if subnet_nsg_id:
+        return resource_id_resource_group(subnet_nsg_id), resource_id_name(subnet_nsg_id), 0
+
+    return "", "", fail("No NIC or subnet NSG is attached to the Linux VM. Cannot toggle the SSH rule.")
+
+
+def handle_nsg_ssh(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
+
+    state, code = inspect_deployment_state(args)
+    if code or not state:
+        return code or 1
+
+    nsg_resource_group, nsg_name, code = selected_vm_nsg(args, state)
+    if code:
+        return code
+    if not nsg_resource_group or not nsg_name:
+        return fail("Unable to determine the target NSG for the SSH rule.")
+
+    print("# Linux SSH NSG Toggle")
+    print(f"\nResource group: {args.resource_group}")
+    print(f"VM: {args.vm_name}")
+    print(f"Target NSG: {nsg_name}")
+
+    if args.action == "enable":
+        print(f"\n## Enable {SSH_NSG_RULE_NAME}")
+        result = create_or_update_nsg_rule(nsg_resource_group, nsg_name, SSH_NSG_RULE_NAME)
+        if not result.ok:
+            return fail(f"Unable to enable public SSH rule {SSH_NSG_RULE_NAME}.", result)
+        print("- direct public SSH enabled from Internet to TCP 22")
+        print_ssh_command(args)
+        return 0
+
+    print(f"\n## Disable {SSH_NSG_RULE_NAME}")
+    existing = show_nsg_rule(nsg_resource_group, nsg_name, SSH_NSG_RULE_NAME)
+    if resource_missing(existing):
+        print("- direct public SSH was already disabled; managed rule was not present")
+        return 0
+    if not existing.ok:
+        return fail(f"Unable to inspect public SSH rule {SSH_NSG_RULE_NAME}.", existing)
+
+    deleted = delete_nsg_rule(nsg_resource_group, nsg_name, SSH_NSG_RULE_NAME)
+    if not deleted.ok:
+        return fail(f"Unable to disable public SSH rule {SSH_NSG_RULE_NAME}.", deleted)
+    print("- direct public SSH disabled; managed rule removed")
+    return 0
 
 
 def resolved_config_script(path: str) -> Path:
@@ -1359,6 +1708,8 @@ def run_guest_configuration(args: argparse.Namespace) -> int:
 
 
 def handle_dryrun(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
@@ -1370,6 +1721,8 @@ def handle_dryrun(args: argparse.Namespace) -> int:
 
 
 def handle_apply(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
@@ -1382,6 +1735,8 @@ def handle_apply(args: argparse.Namespace) -> int:
 
 
 def handle_validate(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
@@ -1400,6 +1755,8 @@ def handle_validate(args: argparse.Namespace) -> int:
 
 
 def handle_configure(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
@@ -1409,11 +1766,13 @@ def handle_configure(args: argparse.Namespace) -> int:
 
 
 def handle_recreate(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
 
-    print("# Secure Windows VM Recreate Plan")
+    print(f"# Secure {os_display_name(args)} VM Recreate Plan")
     print(f"\nMode: {'RECREATE EXECUTE' if args.execute else 'RECREATE DRY RUN'}")
     print(f"Subscription: {state.subscription_name} ({state.subscription_id})")
     print(f"Tenant: {state.tenant_id or 'unknown'}")
@@ -1461,11 +1820,13 @@ def handle_recreate(args: argparse.Namespace) -> int:
 
 
 def handle_teardown(args: argparse.Namespace) -> int:
+    if validate_command_options(args):
+        return 1
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
 
-    print("# Secure Windows VM Teardown Plan")
+    print(f"# Secure {os_display_name(args)} VM Teardown Plan")
     print(f"\nMode: {'TEARDOWN EXECUTE' if args.execute else 'TEARDOWN DRY RUN'}")
     print(f"Subscription: {state.subscription_name} ({state.subscription_id})")
     print(f"Tenant: {state.tenant_id or 'unknown'}")
@@ -1506,6 +1867,7 @@ def main() -> int:
 
     parser = build_parser()
     args = parser.parse_args()
+    apply_os_defaults(args)
 
     handlers = {
         "dryrun": handle_dryrun,
@@ -1514,6 +1876,7 @@ def main() -> int:
         "configure": handle_configure,
         "recreate": handle_recreate,
         "teardown": handle_teardown,
+        "nsg-ssh": handle_nsg_ssh,
     }
     return handlers[args.command](args)
 

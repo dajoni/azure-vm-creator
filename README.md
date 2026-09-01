@@ -1,11 +1,11 @@
-# Azure Windows VM Utility
+# Azure VM Utility
 
 This workspace contains:
 
 - `scripts/azure_windows_vm.py`
 - `scripts/configure_windows_vm.ps1`
 
-It creates an idempotent Windows Server VM in the current Azure CLI default subscription. The VM has a public IP address for outbound internet access, but the script does not create a public inbound RDP rule. Desktop access is intended to go through Azure Bastion Developer using browser-based RDP in the Azure portal.
+It creates an idempotent Windows Server or Linux VM in the current Azure CLI default subscription. The VM has a public IP address for outbound internet access, but the script does not create a public inbound RDP or SSH rule. Access is intended to go through Azure Bastion Developer in the Azure portal.
 
 ## Prerequisites
 
@@ -26,6 +26,7 @@ Create or complete missing resources:
 
 ```bash
 python3 scripts/azure_windows_vm.py apply
+python3 scripts/azure_windows_vm.py apply --os-type linux
 ```
 
 Create or complete missing resources, then stage desktop guest configuration:
@@ -38,6 +39,7 @@ Validate the deployed Azure state against the script's expected configuration:
 
 ```bash
 python3 scripts/azure_windows_vm.py validate
+python3 scripts/azure_windows_vm.py validate --os-type linux
 ```
 
 Stage desktop guest configuration against an existing VM:
@@ -75,6 +77,7 @@ python3 scripts/azure_windows_vm.py teardown --resource-group rg-secure-winvm --
 Shared options are available on `dryrun`, `apply`, `validate`, `configure`, `recreate`, and `teardown`:
 
 ```bash
+python3 scripts/azure_windows_vm.py apply --os-type linux
 python3 scripts/azure_windows_vm.py apply --location northeurope
 python3 scripts/azure_windows_vm.py apply --resource-group rg-secure-winvm
 python3 scripts/azure_windows_vm.py apply --vm-name vm-secure-win
@@ -86,6 +89,18 @@ python3 scripts/azure_windows_vm.py apply --public-ip-name pip-secure-win
 python3 scripts/azure_windows_vm.py apply --vnet-name vnet-secure-win
 python3 scripts/azure_windows_vm.py apply --subnet-name subnet-secure-win
 python3 scripts/azure_windows_vm.py apply --bastion-name bastion-secure-win
+```
+
+Linux examples:
+
+```bash
+python3 scripts/azure_windows_vm.py dryrun --os-type linux
+python3 scripts/azure_windows_vm.py apply --os-type linux
+python3 scripts/azure_windows_vm.py apply --os-type linux --ssh-key-values ~/.ssh/id_ed25519.pub
+python3 scripts/azure_windows_vm.py apply --os-type linux --linux-image Ubuntu2404
+python3 scripts/azure_windows_vm.py nsg-ssh enable --os-type linux
+python3 scripts/azure_windows_vm.py nsg-ssh disable --os-type linux
+python3 scripts/azure_windows_vm.py validate --os-type linux
 ```
 
 VM size examples:
@@ -108,6 +123,12 @@ python3 scripts/azure_windows_vm.py apply --image-sku 2022-datacenter-azure-edit
 python3 scripts/azure_windows_vm.py apply --image-sku 2022-datacenter-azure-edition-hotpatch
 ```
 
+`--image-sku` applies to Windows only. Linux uses `--linux-image`, which accepts an Azure CLI image alias, full URN, custom image name, or image ID. The Linux default is Canonical Ubuntu 26.04 LTS:
+
+```text
+Canonical:ubuntu-26_04-lts:server:latest
+```
+
 Guest configuration staging options are available on `apply`, `configure`, and `recreate`:
 
 ```bash
@@ -119,25 +140,53 @@ python3 scripts/azure_windows_vm.py configure --run-command-name configure-windo
 
 `--run-command-name` is used as the base name for a temporary managed Run Command resource. The script appends a timestamp and random suffix for each staging run.
 
+Guest configuration is Windows-only. Linux VMs are SSH-ready only in this version; `configure`, `apply --configure`, and `recreate --configure` fail early when `--os-type linux` is selected.
+
+## Linux SSH NSG Toggle
+
+Linux VM creation does not create a public inbound SSH rule. Use Azure Bastion Developer for portal SSH by default.
+
+To enable direct public SSH on demand:
+
+```bash
+python3 scripts/azure_windows_vm.py nsg-ssh enable --os-type linux
+```
+
+To disable the script-managed direct public SSH rule:
+
+```bash
+python3 scripts/azure_windows_vm.py nsg-ssh disable --os-type linux
+```
+
+The toggle manages only the `AllowSshFromInternet` rule. Enabling creates or updates that rule to allow inbound TCP `22` from `Internet`, then prints an `ssh azureuser@<public-ip>` command. Disabling removes only that managed rule and does not delete user-created SSH rules with other names.
+
 ## Defaults
 
 - Region: `northeurope`
-- Resource group: `rg-secure-winvm`
-- VM name: `vm-secure-win`
-- Image: `MicrosoftWindowsServer:WindowsServer:2025-datacenter-azure-edition:latest`
-- Image SKU: `2025-datacenter-azure-edition`
+- OS type: `windows`
+- Windows resource group: `rg-secure-winvm`
+- Linux resource group: `rg-secure-linuxvm`
+- Windows VM name: `vm-secure-win`
+- Linux VM name: `vm-secure-linux`
+- Windows image: `MicrosoftWindowsServer:WindowsServer:2025-datacenter-azure-edition:latest`
+- Windows image SKU: `2025-datacenter-azure-edition`
+- Linux image: `Canonical:ubuntu-26_04-lts:server:latest`
 - Size: `Standard_B2as_v2` with 2 vCPU and 8 GiB RAM
 - OS disk: `127` GB
 - OS disk storage: `StandardSSD_LRS`
 - OS disk delete option: `Delete`
-- VNet: `vnet-secure-win`
-- Subnet: `subnet-secure-win`
+- Windows VNet: `vnet-secure-win`
+- Linux VNet: `vnet-secure-linux`
+- Windows subnet: `subnet-secure-win`
+- Linux subnet: `subnet-secure-linux`
 - Address space: `10.42.0.0/16`
 - VM subnet prefix: `10.42.1.0/24`
 - Bastion: Developer SKU
-- VM public IP: Standard static public IP named `pip-secure-win`
+- Windows VM public IP: Standard static public IP named `pip-secure-win`
+- Linux VM public IP: Standard static public IP named `pip-secure-linux`
 - Outbound internet: VM public IP
-- Default public RDP NSG rule: none
+- Default public RDP/SSH NSG rule: none
+- Linux direct public SSH rule: disabled by default; toggle with `nsg-ssh`
 - Guest configuration staging script: `scripts/configure_windows_vm.ps1`
 - Managed Run Command base name: `configure-windows-vm`
 
@@ -154,11 +203,11 @@ After a successful run, the script prints:
 - Subscription
 - Tenant
 
-Bastion Developer supports portal-based browser RDP only. The script does not create a local RDP tunnel or native RDP client connection.
+Bastion Developer supports portal-based browser RDP for Windows and portal-based browser SSH for Linux. The script does not create a local tunnel or native client connection.
 
-The public IP is present so the VM can initiate outbound internet connections. The script still passes `--nsg-rule NONE` to `az vm create`, so Azure CLI does not add a public inbound RDP rule. Do not add an `Internet -> 3389` NSG rule unless you intentionally want direct public RDP exposure.
+The public IP is present so the VM can initiate outbound internet connections. The script still passes `--nsg-rule NONE` to `az vm create`, so Azure CLI does not add a public inbound RDP or SSH rule. For Linux, use `nsg-ssh enable --os-type linux` only when you intentionally want direct public SSH access.
 
-Use `validate` to check that the deployed resources still match the script, including the VM size, disk settings, image publisher/offer/SKU, expected public IP attachment, Bastion SKU, VNet/subnet prefixes, and absence of a configured public inbound RDP allow rule on the VM NIC or subnet NSG. Validation also prints all configured custom NSG rules plus the VM private and public IP addresses when the VM can be read.
+Use `validate` to check that the deployed resources still match the script, including the VM size, disk settings, image publisher/offer/SKU when the expected image is a full URN, expected public IP attachment, Bastion SKU, and VNet/subnet prefixes. Windows validation fails on public inbound RDP. Linux validation warns, but does not fail, when public inbound SSH is enabled. Validation also prints all configured custom NSG rules plus the VM private and public IP addresses when the VM can be read.
 
 Use `configure`, `apply --configure`, or `recreate --execute --configure` to stage guest configuration through a temporary managed Azure VM Run Command resource. This does not require public inbound RDP or WinRM. Azure Run Command runs only the staging step in the default managed context, prints the staging output, then deletes the temporary managed Run Command resource.
 
@@ -172,9 +221,15 @@ The desktop installer writes `C:\ProgramData\AzureVmCreator\configure.log`, inst
 
 ## Password Handling
 
-The script prompts for the local Windows admin password only when it needs to create the VM. Guest configuration staging does not require or store the Windows password. It registers an interactive logon task for the configured admin user instead.
+The script prompts for the local Windows admin password only when it needs to create a Windows VM. Guest configuration staging does not require or store the Windows password. It registers an interactive logon task for the configured admin user instead.
 
 One caveat: Azure CLI receives the password as a process argument during VM creation. Avoid running VM creation from a shared machine where local process arguments may be visible to other users.
+
+## Linux SSH Keys
+
+Linux VM creation uses SSH authentication. If `--ssh-key-values` is omitted, the script passes `--generate-ssh-keys` to `az vm create`. Azure CLI creates SSH public and private key files only if they are missing and stores them in `~/.ssh`; it does not intentionally rotate existing keys.
+
+Use `--ssh-key-values` to provide one or more public key file paths or public key values. When `--ssh-key-values` is provided, the script does not pass `--generate-ssh-keys`.
 
 ## Safety
 
@@ -200,7 +255,9 @@ python3 scripts/azure_windows_vm.py validate --help
 python3 scripts/azure_windows_vm.py configure --help
 python3 scripts/azure_windows_vm.py recreate --help
 python3 scripts/azure_windows_vm.py teardown --help
+python3 scripts/azure_windows_vm.py nsg-ssh --help
 python3 scripts/azure_windows_vm.py dryrun
+python3 scripts/azure_windows_vm.py dryrun --os-type linux
 python3 scripts/azure_windows_vm.py teardown
 python3 scripts/azure_windows_vm.py validate
 ```
