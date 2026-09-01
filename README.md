@@ -145,7 +145,7 @@ python3 scripts/azure_windows_vm.py configure --run-command-name configure-windo
 
 For Windows, `--config-script` points to the local PowerShell staging script. The staging script is copied through Azure Run Command, writes the desktop installer to `C:\ProgramData\AzureVmCreator\configure_windows_vm.ps1`, and registers a one-time scheduled task for the next interactive `azureuser` logon.
 
-For Linux, `--config-script` points to `scripts/configure_linux_vm.sh` by default. The script runs through Azure `RunShellScript`, prompts locally for the Linux desktop password, installs Docker from Docker's official Ubuntu apt repository, installs agent-host tools, installs a lightweight XFCE/xrdp desktop, starts Docker and xrdp, sets the `azureuser` desktop password, and configures UFW inside the guest to allow only OpenSSH and TCP `3389` inbound. It does not create, update, or delete Azure NSG rules.
+For Linux, `--config-script` points to `scripts/configure_linux_vm.sh` by default. The script runs through Azure `RunShellScript`, prompts locally for the Linux desktop password, installs Docker from Docker's official Ubuntu apt repository, installs agent-host tools, installs a lightweight XFCE/xrdp desktop, installs Google Chrome from Google's Debian package, installs Firefox, installs Claude Desktop from Anthropic's apt repository after verifying its signing key fingerprint, installs ChatGPT Desktop for Linux from OpenAI's Linux package, creates desktop launchers for Chrome, Firefox, ChatGPT, and Claude, starts Docker and xrdp, sets the `azureuser` desktop password, and resets/configures UFW inside the guest to allow only OpenSSH and TCP `3389` inbound. It does not create, update, or delete Azure NSG rules.
 
 `--run-command-name` is used as the base name for a temporary managed Run Command resource. The script appends a timestamp and random suffix for each staging run.
 
@@ -242,7 +242,7 @@ powershell.exe -NoExit -ExecutionPolicy Bypass -File C:\ProgramData\AzureVmCreat
 
 The desktop installer writes `C:\ProgramData\AzureVmCreator\configure.log`, installs ChatGPT, Claude, and Git through `winget`, writes `C:\ProgramData\AzureVmCreator\configured.txt` after success, and removes the scheduled task only after all installs succeed. Failed installs leave the task in place for retry at the next login.
 
-Linux configuration runs immediately through `RunShellScript`. It installs `git`, `tmux`, `ufw`, Docker, common build and agent-host tools, and `xubuntu-desktop-minimal` with xrdp. After it succeeds, enable public RDP explicitly with:
+Linux configuration runs immediately through `RunShellScript`. It installs `git`, `tmux`, `ufw`, Docker, common build and agent-host tools, `xubuntu-desktop-minimal` with xrdp, Google Chrome, Firefox, Claude Desktop, and ChatGPT Desktop for Linux. It creates desktop launchers for Chrome, Firefox, ChatGPT, and Claude. Google Chrome is installed on `amd64`; the script skips Chrome on other architectures if Google's Debian package is unavailable. After configuration succeeds, enable public RDP explicitly with:
 
 ```bash
 python3 scripts/azure_windows_vm.py nsg rdp enable --os-type linux
@@ -254,7 +254,7 @@ The script prompts for the local Windows admin password only when it needs to cr
 
 Linux `configure --os-type linux` prompts for the Linux desktop password and passes it once to Azure Run Command so xrdp can authenticate the configured admin user. The script redacts that parameter in local command logging.
 
-One caveat: Azure CLI receives the password as a process argument during VM creation. Avoid running VM creation from a shared machine where local process arguments may be visible to other users.
+One caveat: Azure CLI receives passwords as process arguments during Windows VM creation and Linux guest configuration. Avoid running those commands from a shared machine where local process arguments may be visible to other users.
 
 ## Linux SSH Keys
 

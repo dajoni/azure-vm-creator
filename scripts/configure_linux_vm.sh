@@ -15,6 +15,14 @@ for arg in "$@"; do
   esac
 done
 
+if [[ -z "$admin_username" && $# -ge 1 ]]; then
+  admin_username="$1"
+fi
+
+if [[ -z "$desktop_password" && $# -ge 2 ]]; then
+  desktop_password="$2"
+fi
+
 if [[ -z "$admin_username" ]]; then
   echo "AdminUsername parameter is required." >&2
   exit 2
@@ -38,8 +46,14 @@ export DEBIAN_FRONTEND=noninteractive
 
 user_home="$(getent passwd "$admin_username" | cut -d: -f6)"
 user_group="$(id -gn "$admin_username")"
+dpkg_arch="$(dpkg --print-architecture)"
 install_root="/var/lib/azure-vm-creator"
 mkdir -p "$install_root"
+tmp_dir="$(mktemp -d)"
+cleanup() {
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
 
 echo "Updating apt metadata..."
 apt-get update
@@ -112,22 +126,96 @@ printf 'startxfce4\n' >"$user_home/.xsession"
 chown "$admin_username:$user_group" "$user_home/.xsession"
 chmod 0644 "$user_home/.xsession"
 
+echo "Installing Google Chrome from Google's official Debian package..."
+if [[ "$dpkg_arch" == "amd64" ]]; then
+  chrome_deb="$tmp_dir/google-chrome-stable_current_amd64.deb"
+  curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o "$chrome_deb"
+  apt-get install -y "$chrome_deb"
+else
+  echo "Skipping Google Chrome: Google's Linux .deb installer is not available for architecture $dpkg_arch." >&2
+fi
+
+echo "Installing Claude Desktop from Anthropic's official apt repository..."
+curl -fsSLo /usr/share/keyrings/claude-desktop-archive-keyring.asc https://downloads.claude.ai/claude-desktop/key.asc
+claude_key_fingerprint="$(gpg --show-keys --with-colons /usr/share/keyrings/claude-desktop-archive-keyring.asc | awk -F: '$1 == "fpr" { print $10; exit }')"
+if [[ "$claude_key_fingerprint" != "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE" ]]; then
+  echo "Unexpected Claude Desktop apt signing key fingerprint: ${claude_key_fingerprint:-unavailable}" >&2
+  exit 2
+fi
+cat >/etc/apt/sources.list.d/claude-desktop.list <<'CLAUDE_SOURCES'
+deb [signed-by=/usr/share/keyrings/claude-desktop-archive-keyring.asc] https://downloads.claude.ai/claude-desktop/apt/stable stable main
+CLAUDE_SOURCES
+apt-get update
+apt-get install -y claude-desktop
+
+echo "Installing ChatGPT Desktop for Linux from OpenAI's official package..."
+case "$dpkg_arch" in
+  amd64)
+    chatgpt_deb="$tmp_dir/chatgpt_amd64.deb"
+    curl -fsSL https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_amd64.deb -o "$chatgpt_deb"
+    ;;
+  arm64)
+    chatgpt_deb="$tmp_dir/chatgpt_arm64.deb"
+    curl -fsSL https://persistent.oaistatic.com/codex-app-prod/linux/deb/latest/chatgpt_arm64.deb -o "$chatgpt_deb"
+    ;;
+  *)
+    echo "Unsupported architecture for ChatGPT Desktop: $dpkg_arch" >&2
+    exit 2
+    ;;
+esac
+apt-get install -y "$chatgpt_deb"
+
+echo "Applying all available apt package upgrades..."
+apt-get update
+apt-get upgrade -y
+
+echo "Creating desktop launchers for browser and AI apps..."
 mkdir -p "$user_home/Desktop"
+
+cat >"$user_home/Desktop/Google Chrome.desktop" <<'CHROME_DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Google Chrome
+Exec=google-chrome
+Icon=google-chrome
+Terminal=false
+Categories=Network;WebBrowser;
+CHROME_DESKTOP
+
+cat >"$user_home/Desktop/Firefox.desktop" <<'FIREFOX_DESKTOP'
+[Desktop Entry]
+Type=Application
+Name=Firefox
+Exec=firefox
+Icon=firefox
+Terminal=false
+Categories=Network;WebBrowser;
+FIREFOX_DESKTOP
+
 cat >"$user_home/Desktop/ChatGPT.desktop" <<'CHATGPT_DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=ChatGPT
-Exec=firefox https://chatgpt.com
+Exec=chatgpt
+Icon=chatgpt
 Terminal=false
+Categories=Office;Development;
 CHATGPT_DESKTOP
+
 cat >"$user_home/Desktop/Claude.desktop" <<'CLAUDE_DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Claude
-Exec=firefox https://claude.ai
+Exec=claude-desktop
+Icon=claude-desktop
 Terminal=false
+Categories=Office;Development;
 CLAUDE_DESKTOP
-chmod 0755 "$user_home/Desktop/ChatGPT.desktop" "$user_home/Desktop/Claude.desktop"
+
+chmod 0755 "$user_home/Desktop/Google Chrome.desktop" \
+  "$user_home/Desktop/Firefox.desktop" \
+  "$user_home/Desktop/ChatGPT.desktop" \
+  "$user_home/Desktop/Claude.desktop"
 chown -R "$admin_username:$user_group" "$user_home/Desktop"
 
 systemctl enable --now xrdp

@@ -116,7 +116,8 @@ class NsgRuleSpec:
     port: str
 
 
-def redacted_command(command: list[str]) -> str:
+def redacted_command(command: list[str], sensitive_values: set[str] | None = None) -> str:
+    sensitive_values = sensitive_values or set()
     redacted: list[str] = []
     redact_next = False
     for part in command:
@@ -124,7 +125,7 @@ def redacted_command(command: list[str]) -> str:
             redacted.append("<redacted>")
             redact_next = False
             continue
-        if any(part.startswith(prefix) for prefix in SENSITIVE_PREFIXES):
+        if part in sensitive_values or any(part.startswith(prefix) for prefix in SENSITIVE_PREFIXES):
             redacted.append("<redacted>")
         else:
             redacted.append(part)
@@ -133,9 +134,9 @@ def redacted_command(command: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in redacted)
 
 
-def az(args: list[str], timeout: int = 300) -> CommandResult:
+def az(args: list[str], timeout: int = 300, sensitive_values: set[str] | None = None) -> CommandResult:
     command = ["az", *args, "--only-show-errors", "--output", "json"]
-    print(f"$ {redacted_command(command)}", file=sys.stderr)
+    print(f"$ {redacted_command(command, sensitive_values)}", file=sys.stderr)
     try:
         proc = subprocess.run(
             command,
@@ -201,12 +202,18 @@ def get_path(value: Any, *paths: str, default: Any = None) -> Any:
     return default
 
 
-def run_step(label: str, args: list[str], execute: bool, timeout: int = 300) -> CommandResult:
+def run_step(
+    label: str,
+    args: list[str],
+    execute: bool,
+    timeout: int = 300,
+    sensitive_values: set[str] | None = None,
+) -> CommandResult:
     if not execute:
         print(f"- would {label}")
         return CommandResult(True, ["az", *args])
     print(f"- {label}")
-    result = az(args, timeout=timeout)
+    result = az(args, timeout=timeout, sensitive_values=sensitive_values)
     if not result.ok:
         print(f"  failed: {concise_error(result.error)}")
     return result
@@ -1719,11 +1726,12 @@ def run_linux_guest_configuration(args: argparse.Namespace) -> int:
             "--scripts",
             f"@{script}",
             "--parameters",
-            f"AdminUsername={args.admin_username}",
-            f"DesktopPassword={desktop_password}",
+            args.admin_username,
+            desktop_password,
         ],
         execute=True,
         timeout=5400,
+        sensitive_values={desktop_password},
     )
     if not result.ok:
         return 1
