@@ -49,12 +49,16 @@ DEFAULT_LINUX_BASTION_NAME = "bastion-secure-linux"
 DEFAULT_VM_PUBLIC_IP_NAME = "pip-secure-win"
 DEFAULT_LINUX_VM_PUBLIC_IP_NAME = "pip-secure-linux"
 DEFAULT_CONFIG_SCRIPT = "scripts/configure_windows_vm.ps1"
+DEFAULT_LINUX_CONFIG_SCRIPT = "scripts/configure_linux_vm.sh"
 DEFAULT_RUN_COMMAND_NAME = "configure-windows-vm"
+DEFAULT_LINUX_RUN_COMMAND_NAME = "configure-linux-vm"
 DEFAULT_VNET_PREFIX = "10.42.0.0/16"
 DEFAULT_SUBNET_PREFIX = "10.42.1.0/24"
 OS_TYPES = {"windows", "linux"}
 SSH_NSG_RULE_NAME = "AllowSshFromInternet"
 SSH_NSG_RULE_PRIORITY = "1000"
+RDP_NSG_RULE_NAME = "AllowLinuxRdpFromInternet"
+RDP_NSG_RULE_PRIORITY = "1010"
 
 
 @dataclass
@@ -100,6 +104,16 @@ class ResourcePlan:
 
 
 SENSITIVE_FLAGS = {"--admin-password", "--password", "--run-as-password", "--secret", "--value"}
+SENSITIVE_PREFIXES = ("DesktopPassword=",)
+
+
+@dataclass(frozen=True)
+class NsgRuleSpec:
+    service: str
+    display_name: str
+    rule_name: str
+    priority: str
+    port: str
 
 
 def redacted_command(command: list[str]) -> str:
@@ -110,7 +124,10 @@ def redacted_command(command: list[str]) -> str:
             redacted.append("<redacted>")
             redact_next = False
             continue
-        redacted.append(part)
+        if any(part.startswith(prefix) for prefix in SENSITIVE_PREFIXES):
+            redacted.append("<redacted>")
+        else:
+            redacted.append(part)
         if part in SENSITIVE_FLAGS:
             redact_next = True
     return " ".join(shlex.quote(part) for part in redacted)
@@ -259,8 +276,20 @@ def show_nsg_rule(resource_group: str, nsg_name: str, rule_name: str) -> Command
     )
 
 
-def create_or_update_nsg_rule(resource_group: str, nsg_name: str, rule_name: str) -> CommandResult:
-    existing = show_nsg_rule(resource_group, nsg_name, rule_name)
+def nsg_rule_spec(service: str) -> NsgRuleSpec:
+    specs = {
+        "ssh": NsgRuleSpec("ssh", "SSH", SSH_NSG_RULE_NAME, SSH_NSG_RULE_PRIORITY, "22"),
+        "rdp": NsgRuleSpec("rdp", "RDP", RDP_NSG_RULE_NAME, RDP_NSG_RULE_PRIORITY, "3389"),
+    }
+    return specs[service]
+
+
+def linux_public_access_specs() -> list[NsgRuleSpec]:
+    return [nsg_rule_spec("ssh"), nsg_rule_spec("rdp")]
+
+
+def create_or_update_nsg_rule(resource_group: str, nsg_name: str, spec: NsgRuleSpec) -> CommandResult:
+    existing = show_nsg_rule(resource_group, nsg_name, spec.rule_name)
     if not existing.ok and not resource_missing(existing):
         return existing
     action = "update" if existing.ok else "create"
@@ -275,9 +304,9 @@ def create_or_update_nsg_rule(resource_group: str, nsg_name: str, rule_name: str
             "--nsg-name",
             nsg_name,
             "--name",
-            rule_name,
+            spec.rule_name,
             "--priority",
-            SSH_NSG_RULE_PRIORITY,
+            spec.priority,
             "--direction",
             "Inbound",
             "--access",
@@ -291,7 +320,7 @@ def create_or_update_nsg_rule(resource_group: str, nsg_name: str, rule_name: str
             "--destination-address-prefixes",
             "*",
             "--destination-port-ranges",
-            "22",
+            spec.port,
         ],
         timeout=300,
     )
@@ -385,10 +414,10 @@ def validate_password(password: str) -> str | None:
     return None
 
 
-def prompt_password() -> str:
+def prompt_password(label: str = "Windows admin password") -> str:
     while True:
-        password = getpass.getpass("Windows admin password: ")
-        confirm = getpass.getpass("Confirm Windows admin password: ")
+        password = getpass.getpass(f"{label}: ")
+        confirm = getpass.getpass(f"Confirm {label}: ")
         if password != confirm:
             print("Passwords did not match.", file=sys.stderr)
             continue
@@ -626,9 +655,6 @@ def validate_existing_state(
         warnings.append(f"{label}{suffix}")
         print(f"- WARN: {label}{suffix}")
 
-    protocol = access_protocol(args)
-    port = access_port(args)
-
     print(f"# Secure {os_display_name(args)} VM Validation")
     print(f"\nSubscription: {subscription_name} ({subscription_id})")
     print(f"Tenant: {tenant_id or 'unknown'}")
@@ -733,8 +759,9 @@ def validate_existing_state(
     check(bool(nsg_ids), "NIC or subnet has an NSG attached", "no configured NSG found")
 
     nsg_rule_summaries: dict[str, list[str]] = {}
-    public_access_rules: list[str] = []
-    managed_ssh_rule_found = False
+    linux_public_access_rules: dict[str, list[str]] = {spec.service: [] for spec in linux_public_access_specs()}
+    linux_managed_rules_found: dict[str, bool] = {spec.service: False for spec in linux_public_access_specs()}
+    windows_public_rdp_rules: list[str] = []
     for nsg_id in nsg_ids:
         nsg = show_nsg_by_id(nsg_id)
         nsg_name = resource_id_name(nsg_id)
@@ -747,22 +774,31 @@ def validate_existing_state(
             if isinstance(rule, dict)
         ]
         for rule in as_list(nsg.data.get("securityRules")):
-            if not isinstance(rule, dict) or not rule_allows_public_access(rule, port):
+            if not isinstance(rule, dict):
                 continue
             rule_ref = f"{nsg_name}/{rule.get('name', 'unnamed')}"
-            public_access_rules.append(rule_ref)
-            if args.os_type == "linux" and str(rule.get("name") or "") == SSH_NSG_RULE_NAME:
-                managed_ssh_rule_found = True
+            if args.os_type == "linux":
+                for spec in linux_public_access_specs():
+                    if not rule_allows_public_access(rule, int(spec.port)):
+                        continue
+                    linux_public_access_rules[spec.service].append(rule_ref)
+                    if str(rule.get("name") or "") == spec.rule_name:
+                        linux_managed_rules_found[spec.service] = True
+            elif rule_allows_public_access(rule, 3389):
+                windows_public_rdp_rules.append(rule_ref)
+
     if args.os_type == "linux":
-        if public_access_rules:
-            warn(f"configured public inbound {protocol} allow rule", ", ".join(public_access_rules))
-        if managed_ssh_rule_found:
-            warn(f"script-managed {SSH_NSG_RULE_NAME} rule is enabled")
+        for spec in linux_public_access_specs():
+            public_access_rules = linux_public_access_rules[spec.service]
+            if public_access_rules:
+                warn(f"configured public inbound {spec.display_name} allow rule", ", ".join(public_access_rules))
+            if linux_managed_rules_found[spec.service]:
+                warn(f"script-managed {spec.rule_name} rule is enabled")
     else:
         check(
-            not public_access_rules,
-            f"no configured public inbound {protocol} allow rule",
-            ", ".join(public_access_rules),
+            not windows_public_rdp_rules,
+            "no configured public inbound RDP allow rule",
+            ", ".join(windows_public_rdp_rules),
         )
 
     print("\n## Network Security Group Rules")
@@ -929,16 +965,19 @@ def add_shared_options(parser: argparse.ArgumentParser) -> None:
 def add_config_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config-script",
-        default=DEFAULT_CONFIG_SCRIPT,
+        default=None,
         help=(
-            "Local PowerShell staging script to run with Azure VM Run Command. "
-            f"Default: {DEFAULT_CONFIG_SCRIPT}."
+            "Local guest configuration script to run with Azure VM Run Command. "
+            f"Default: {DEFAULT_CONFIG_SCRIPT} for Windows, {DEFAULT_LINUX_CONFIG_SCRIPT} for Linux."
         ),
     )
     parser.add_argument(
         "--run-command-name",
-        default=DEFAULT_RUN_COMMAND_NAME,
-        help=f"Base name for temporary managed VM Run Command resources. Default: {DEFAULT_RUN_COMMAND_NAME}.",
+        default=None,
+        help=(
+            "Base name for temporary managed VM Run Command resources. "
+            f"Default: {DEFAULT_RUN_COMMAND_NAME} for Windows, {DEFAULT_LINUX_RUN_COMMAND_NAME} for Linux."
+        ),
     )
 
 
@@ -960,13 +999,13 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "--configure",
         action="store_true",
-        help="Stage the guest configuration scheduled task after applying Azure resources.",
+        help="Run guest configuration after applying Azure resources.",
     )
 
     validate = subparsers.add_parser("validate", help="Validate deployed Azure state against this script.")
     add_shared_options(validate)
 
-    configure = subparsers.add_parser("configure", help="Stage the guest configuration scheduled task on the existing VM.")
+    configure = subparsers.add_parser("configure", help="Run guest configuration on the existing VM.")
     add_shared_options(configure)
     add_config_options(configure)
 
@@ -977,16 +1016,17 @@ def build_parser() -> argparse.ArgumentParser:
     recreate.add_argument(
         "--configure",
         action="store_true",
-        help="Stage the guest configuration scheduled task after recreating Azure resources.",
+        help="Run guest configuration after recreating Azure resources.",
     )
 
     teardown = subparsers.add_parser("teardown", help="Plan or execute removal of the script-owned resource group.")
     add_shared_options(teardown)
     teardown.add_argument("--execute", action="store_true", help="Delete the resource group. Without this flag, teardown is a dry run.")
 
-    nsg_ssh = subparsers.add_parser("nsg-ssh", help="Enable or disable the script-managed public SSH NSG rule for a Linux VM.")
-    nsg_ssh.add_argument("action", choices=["enable", "disable"], help="Enable or disable direct public SSH.")
-    add_shared_options(nsg_ssh)
+    nsg = subparsers.add_parser("nsg", help="Enable or disable script-managed public access NSG rules for a Linux VM.")
+    nsg.add_argument("service", choices=["ssh", "rdp"], help="Public access rule to manage.")
+    nsg.add_argument("action", choices=["enable", "disable"], help="Enable or disable the selected public access rule.")
+    add_shared_options(nsg)
 
     return parser
 
@@ -1000,6 +1040,8 @@ def apply_os_defaults(args: argparse.Namespace) -> None:
             "subnet_name": DEFAULT_SUBNET_NAME,
             "bastion_name": DEFAULT_BASTION_NAME,
             "public_ip_name": DEFAULT_VM_PUBLIC_IP_NAME,
+            "config_script": DEFAULT_CONFIG_SCRIPT,
+            "run_command_name": DEFAULT_RUN_COMMAND_NAME,
         },
         "linux": {
             "resource_group": DEFAULT_LINUX_RESOURCE_GROUP,
@@ -1008,20 +1050,18 @@ def apply_os_defaults(args: argparse.Namespace) -> None:
             "subnet_name": DEFAULT_LINUX_SUBNET_NAME,
             "bastion_name": DEFAULT_LINUX_BASTION_NAME,
             "public_ip_name": DEFAULT_LINUX_VM_PUBLIC_IP_NAME,
+            "config_script": DEFAULT_LINUX_CONFIG_SCRIPT,
+            "run_command_name": DEFAULT_LINUX_RUN_COMMAND_NAME,
         },
     }
     for attr, value in defaults[args.os_type].items():
-        if getattr(args, attr) is None:
+        if hasattr(args, attr) and getattr(args, attr) is None:
             setattr(args, attr, value)
 
 
 def validate_command_options(args: argparse.Namespace) -> int:
-    if args.command == "nsg-ssh" and args.os_type != "linux":
-        return fail("The `nsg-ssh` command is Linux-only. Rerun with `--os-type linux`.")
-    if args.os_type == "linux" and getattr(args, "configure", False):
-        return fail("Linux guest configuration is not implemented. Run without `--configure` for an SSH-ready Linux VM.")
-    if args.os_type == "linux" and args.command == "configure":
-        return fail("Linux guest configuration is not implemented. The `configure` command is Windows-only.")
+    if args.command == "nsg" and args.os_type != "linux":
+        return fail("The `nsg` command is Linux-only for now. Rerun with `--os-type linux`.")
     if args.os_type == "windows" and args.ssh_key_values:
         return fail("`--ssh-key-values` applies only when `--os-type linux` is selected.")
     return 0
@@ -1206,7 +1246,10 @@ def print_resource_plan(args: argparse.Namespace, state: DeploymentState, mode: 
     print(f"Access: Azure Bastion Developer portal {protocol}")
     print(f"VM public IP: {args.public_ip_name}")
     print("Outbound internet: VM public IP")
-    print(f"Default public {protocol} NSG rule: none")
+    if args.os_type == "linux":
+        print("Default public SSH/RDP NSG rule: none")
+    else:
+        print(f"Default public {protocol} NSG rule: none")
     if args.os_type == "linux":
         ssh_key_mode = "provided SSH key value(s)" if args.ssh_key_values else "Azure CLI --generate-ssh-keys"
         print(f"SSH keys: {ssh_key_mode}")
@@ -1240,9 +1283,10 @@ def print_connection(args: argparse.Namespace, state: DeploymentState, vm: dict[
     print(f"- VM private IP: {private_ip}")
     print(f"- VM public IP: {public_ip}")
     if args.os_type == "linux":
-        print("- Public inbound SSH rule created by this script: none")
+        print("- Public inbound SSH/RDP rules created by this script: none")
         print("- The public IP is for VM outbound internet; use Bastion Developer for portal SSH access.")
-        print("- To enable direct public SSH on demand: nsg-ssh enable --os-type linux")
+        print("- To enable direct public SSH on demand: nsg ssh enable --os-type linux")
+        print("- To enable direct public xrdp after Linux configure: nsg rdp enable --os-type linux")
         if public_ip != "unavailable":
             print(f"- SSH command after enabling direct public SSH: ssh {args.admin_username}@{public_ip}")
     else:
@@ -1273,6 +1317,14 @@ def print_ssh_command(args: argparse.Namespace) -> None:
         print("- SSH command: unavailable; VM public IP could not be read")
         return
     print(f"- SSH command: ssh {args.admin_username}@{public_ip}")
+
+
+def print_rdp_target(args: argparse.Namespace) -> None:
+    public_ip = vm_public_ip_address(args.resource_group, args.vm_name)
+    if public_ip == "unavailable":
+        print("- RDP target: unavailable; VM public IP could not be read")
+        return
+    print(f"- RDP target: {public_ip}:3389")
 
 
 def vm_create_args(args: argparse.Namespace, admin_password: str) -> list[str]:
@@ -1494,13 +1546,14 @@ def selected_vm_nsg(args: argparse.Namespace, state: DeploymentState) -> tuple[s
     if subnet_nsg_id:
         return resource_id_resource_group(subnet_nsg_id), resource_id_name(subnet_nsg_id), 0
 
-    return "", "", fail("No NIC or subnet NSG is attached to the Linux VM. Cannot toggle the SSH rule.")
+    return "", "", fail("No NIC or subnet NSG is attached to the Linux VM. Cannot toggle public access rules.")
 
 
-def handle_nsg_ssh(args: argparse.Namespace) -> int:
+def handle_nsg(args: argparse.Namespace) -> int:
     if validate_command_options(args):
         return 1
 
+    spec = nsg_rule_spec(args.service)
     state, code = inspect_deployment_state(args)
     if code or not state:
         return code or 1
@@ -1509,34 +1562,38 @@ def handle_nsg_ssh(args: argparse.Namespace) -> int:
     if code:
         return code
     if not nsg_resource_group or not nsg_name:
-        return fail("Unable to determine the target NSG for the SSH rule.")
+        return fail(f"Unable to determine the target NSG for the {spec.display_name} rule.")
 
-    print("# Linux SSH NSG Toggle")
+    print(f"# Linux {spec.display_name} NSG Toggle")
     print(f"\nResource group: {args.resource_group}")
     print(f"VM: {args.vm_name}")
     print(f"Target NSG: {nsg_name}")
 
     if args.action == "enable":
-        print(f"\n## Enable {SSH_NSG_RULE_NAME}")
-        result = create_or_update_nsg_rule(nsg_resource_group, nsg_name, SSH_NSG_RULE_NAME)
+        print(f"\n## Enable {spec.rule_name}")
+        result = create_or_update_nsg_rule(nsg_resource_group, nsg_name, spec)
         if not result.ok:
-            return fail(f"Unable to enable public SSH rule {SSH_NSG_RULE_NAME}.", result)
-        print("- direct public SSH enabled from Internet to TCP 22")
-        print_ssh_command(args)
+            return fail(f"Unable to enable public {spec.display_name} rule {spec.rule_name}.", result)
+        print(f"- direct public {spec.display_name} enabled from Internet to TCP {spec.port}")
+        if spec.service == "ssh":
+            print_ssh_command(args)
+        else:
+            print_rdp_target(args)
+            print("- xrdp uses the Linux desktop password configured by `configure --os-type linux`.")
         return 0
 
-    print(f"\n## Disable {SSH_NSG_RULE_NAME}")
-    existing = show_nsg_rule(nsg_resource_group, nsg_name, SSH_NSG_RULE_NAME)
+    print(f"\n## Disable {spec.rule_name}")
+    existing = show_nsg_rule(nsg_resource_group, nsg_name, spec.rule_name)
     if resource_missing(existing):
-        print("- direct public SSH was already disabled; managed rule was not present")
+        print(f"- direct public {spec.display_name} was already disabled; managed rule was not present")
         return 0
     if not existing.ok:
-        return fail(f"Unable to inspect public SSH rule {SSH_NSG_RULE_NAME}.", existing)
+        return fail(f"Unable to inspect public {spec.display_name} rule {spec.rule_name}.", existing)
 
-    deleted = delete_nsg_rule(nsg_resource_group, nsg_name, SSH_NSG_RULE_NAME)
+    deleted = delete_nsg_rule(nsg_resource_group, nsg_name, spec.rule_name)
     if not deleted.ok:
-        return fail(f"Unable to disable public SSH rule {SSH_NSG_RULE_NAME}.", deleted)
-    print("- direct public SSH disabled; managed rule removed")
+        return fail(f"Unable to disable public {spec.display_name} rule {spec.rule_name}.", deleted)
+    print(f"- direct public {spec.display_name} disabled; managed rule removed")
     return 0
 
 
@@ -1627,6 +1684,61 @@ def temporary_run_command_name(base_name: str) -> str:
 
 
 def run_guest_configuration(args: argparse.Namespace) -> int:
+    if args.os_type == "linux":
+        return run_linux_guest_configuration(args)
+    return run_windows_guest_configuration(args)
+
+
+def run_linux_guest_configuration(args: argparse.Namespace) -> int:
+    vm = show_vm(args.resource_group, args.vm_name)
+    if not vm.ok or not isinstance(vm.data, dict):
+        return fail(f"VM {args.vm_name} does not exist or cannot be read. Run `apply --os-type linux` first.", vm)
+
+    script = resolved_config_script(args.config_script)
+    if not script.is_file():
+        return fail(f"Configuration script was not found: {script}")
+
+    desktop_password = prompt_password("Linux desktop password")
+    print("\n## Linux Guest Configuration")
+    print("- Azure Run Command: RunShellScript")
+    print(f"- target desktop user: {args.admin_username}")
+    print("- Azure NSG rules will not be created, updated, or deleted by configure")
+
+    result = run_step(
+        "run Linux guest configuration script",
+        [
+            "vm",
+            "run-command",
+            "invoke",
+            "--resource-group",
+            args.resource_group,
+            "--name",
+            args.vm_name,
+            "--command-id",
+            "RunShellScript",
+            "--scripts",
+            f"@{script}",
+            "--parameters",
+            f"AdminUsername={args.admin_username}",
+            f"DesktopPassword={desktop_password}",
+        ],
+        execute=True,
+        timeout=5400,
+    )
+    if not result.ok:
+        return 1
+
+    print_run_command_output(result.data)
+
+    print("\n## Linux Desktop Access")
+    print("- Linux guest configuration completed")
+    print_rdp_target(args)
+    print("- Enable public RDP explicitly with: nsg rdp enable --os-type linux")
+    print("- Azure NSG rules were not changed by configure")
+    return 0
+
+
+def run_windows_guest_configuration(args: argparse.Namespace) -> int:
     vm = show_vm(args.resource_group, args.vm_name)
     if not vm.ok or not isinstance(vm.data, dict):
         return fail(f"VM {args.vm_name} does not exist or cannot be read. Run `apply` first.", vm)
@@ -1862,7 +1974,7 @@ def main() -> int:
     old_flags = {"--execute", "--validate", "--recreate"}
     if len(sys.argv) > 1 and sys.argv[1] in old_flags:
         return fail(
-            "Top-level flags were removed. Use `dryrun`, `apply`, `validate`, `configure`, `recreate`, or `teardown` subcommands."
+            "Top-level flags were removed. Use `dryrun`, `apply`, `validate`, `configure`, `recreate`, `teardown`, or `nsg` subcommands."
         )
 
     parser = build_parser()
@@ -1876,7 +1988,7 @@ def main() -> int:
         "configure": handle_configure,
         "recreate": handle_recreate,
         "teardown": handle_teardown,
-        "nsg-ssh": handle_nsg_ssh,
+        "nsg": handle_nsg,
     }
     return handlers[args.command](args)
 
